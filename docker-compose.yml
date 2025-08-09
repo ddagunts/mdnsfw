@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  mdns-firewall:
+    build: .
+    #image: mdnsfw
+    container_name: mdns-firewall
+    volumes:
+      - ./data:/app/data  # Persistent storage for permissions
+    environment:
+      - MDNS_PORT=5353
+      - MDNS_ADDRESS=224.0.0.251
+      - WEB_PORT=9080
+      - WEB_HOST=0.0.0.0
+      - PERMISSIONS_FILE=/app/data/permissions.yaml
+      - LOG_LEVEL=DEBUG
+    network_mode: host  # Required for mDNS multicast functionality
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9080/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  data:
+    driver: local
