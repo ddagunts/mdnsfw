@@ -1,6 +1,10 @@
 # mDNS Firewall
 
 A Python-based mDNS reflector/proxy with firewall capabilities that allows administrators to control which clients can publish and read mDNS entries through a web-based management interface.
+<img width="1342" height="932" alt="Screenshot 2025-08-09 at 07 38 25" src="https://github.com/user-attachments/assets/34897c78-e95e-43a5-be34-d3d130fd2b39" />
+<img width="1328" height="949" alt="image" src="https://github.com/user-attachments/assets/4142df08-fe64-49df-a8d2-e58abf8f69dc" />
+
+
 
 ## Features
 
