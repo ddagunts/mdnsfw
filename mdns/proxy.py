@@ -9,7 +9,12 @@ import ipaddress
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field, asdict
 from zeroconf import DNSRecord, DNSQuestion, current_time_millis
-from zeroconf.const import _TYPE_A, _TYPE_PTR, _TYPE_SRV, _TYPE_TXT, _CLASS_IN
+try:
+    # Try newer zeroconf versions first
+    from zeroconf.const import _TYPE_A, _TYPE_PTR, _TYPE_SRV, _TYPE_TXT, _CLASS_IN
+except ImportError:
+    # Fallback to older zeroconf versions
+    from zeroconf import _TYPE_A, _TYPE_PTR, _TYPE_SRV, _TYPE_TXT, _CLASS_IN
 from permissions.manager import PermissionsManager, Action
 from config import Config
 
@@ -48,6 +53,14 @@ class MDNSProxy:
         
         # Load persisted services on initialization
         self._load_services()
+    
+    def _is_valid_ip(self, ip_str: str) -> bool:
+        """Check if a string is a valid IPv4 address"""
+        try:
+            ipaddress.ip_address(ip_str)
+            return True
+        except (ipaddress.AddressValueError, ValueError):
+            return False
     
     def _is_ip_blacklisted(self, ip: str) -> bool:
         """Check if an IP address is in the blacklist"""
@@ -144,33 +157,232 @@ class MDNSProxy:
             self.logger.error(f"Failed to bind to port {self.mdns_port}: {e}")
             return
         
-        # Join multicast group - try multiple approaches for better compatibility
+        # Join multicast group - OpenBSD-compatible approach
+        import platform
+        system = platform.system().lower()
+        
         try:
-            # Method 1: Join on INADDR_ANY (standard approach)
-            mreq = struct.pack("4sl", socket.inet_aton(self.mdns_address), socket.INADDR_ANY)
-            self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-            self.logger.info(f"Joined multicast group {self.mdns_address} on INADDR_ANY")
+            # Get available network interfaces for multicast-capable ones
+            local_ips = []
             
-            # Method 2: Try to join on specific local IPs (improved multicast reception)
-            import subprocess
+            # Method 1: Try Python socket method to find primary interface
             try:
-                # Get local IP addresses using ip command fallback
-                result = subprocess.run(['hostname', '-I'], capture_output=True, text=True, timeout=2)
-                if result.returncode == 0:
-                    local_ips = result.stdout.strip().split()
-                    for local_ip in local_ips:
-                        if not local_ip.startswith('127.') and '::' not in local_ip:
-                            try:
-                                mreq2 = struct.pack("4s4s", socket.inet_aton(self.mdns_address), socket.inet_aton(local_ip))
-                                self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq2)
-                                self.logger.info(f"Joined multicast group {self.mdns_address} on IP {local_ip}")
-                            except Exception as e:
-                                self.logger.debug(f"Could not join multicast on IP {local_ip}: {e}")
+                test_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                test_sock.connect(("8.8.8.8", 80))
+                local_ip = test_sock.getsockname()[0]
+                test_sock.close()
+                if local_ip and not local_ip.startswith('127.'):
+                    local_ips.append(local_ip)
+                    self.logger.debug(f"Found primary local IP: {local_ip}")
             except Exception as e:
-                self.logger.debug(f"Could not get local IPs: {e}")
+                self.logger.debug(f"Socket method for primary IP failed: {e}")
+            
+            # Method 2: Use socket.getaddrinfo() with interface enumeration for better cross-platform support
+            try:
+                # Get all network interfaces
+                interfaces = socket.if_nameindex()
+                
+                for if_index, if_name in interfaces:
+                    # Skip loopback interface
+                    if if_name == 'lo':
+                        continue
+                    
+                    try:
+                        # Try to get hostname associated with this interface using getaddrinfo
+                        # This approach is more portable than ioctl
+                        hostname = socket.gethostname()
+                        
+                        # Check if interface has an assigned IP by attempting to create a socket
+                        # bound to the interface (if supported) or by parsing system commands
+                        temp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        try:
+                            # Try to bind to interface using SO_BINDTODEVICE (Linux)
+                            # This will fail gracefully on systems that don't support it
+                            if hasattr(socket, 'SO_BINDTODEVICE'):
+                                temp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, if_name.encode())
+                                temp_sock.connect(('8.8.8.8', 80))
+                                local_ip = temp_sock.getsockname()[0]
+                                if local_ip and not local_ip.startswith('127.') and local_ip not in local_ips:
+                                    local_ips.append(local_ip)
+                                    self.logger.debug(f"Found interface {if_name} with IP {local_ip} (SO_BINDTODEVICE)")
+                        except (OSError, AttributeError):
+                            # SO_BINDTODEVICE not supported or interface has no IP
+                            pass
+                        finally:
+                            temp_sock.close()
+                            
+                    except Exception as if_e:
+                        self.logger.debug(f"Error processing interface {if_name}: {if_e}")
+                        
+            except Exception as e:
+                self.logger.debug(f"Socket interface enumeration failed: {e}")
+            
+            # Method 3: Parse network configuration files/commands for comprehensive IP discovery
+            try:
+                import subprocess
+                import re
+                
+                # Try multiple command approaches
+                ip_commands = []
+                
+                if system in ['openbsd', 'freebsd', 'netbsd']:
+                    ip_commands = [
+                        ['ifconfig'],
+                        ['ifconfig', '-a'],
+                        ['netstat', '-i']
+                    ]
+                elif system == 'linux':
+                    ip_commands = [
+                        ['ip', 'addr', 'show'],
+                        ['ifconfig', '-a'],
+                        ['hostname', '-I']
+                    ]
+                else:
+                    ip_commands = [['ifconfig', '-a']]
+                
+                for cmd in ip_commands:
+                    try:
+                        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                        if result.returncode == 0:
+                            output = result.stdout
+                            
+                            # Extract IPv4 addresses from the output
+                            if cmd[0] == 'hostname' and '-I' in cmd:
+                                # hostname -I returns space-separated IPs
+                                ips = output.strip().split()
+                                for ip in ips:
+                                    if self._is_valid_ip(ip) and not ip.startswith('127.') and ip not in local_ips:
+                                        local_ips.append(ip)
+                                        self.logger.debug(f"Found IP from hostname -I: {ip}")
+                            elif cmd[0] == 'ip':
+                                # ip addr show output parsing
+                                ip_matches = re.findall(r'inet (\d+\.\d+\.\d+\.\d+)/\d+', output)
+                                for ip in ip_matches:
+                                    if self._is_valid_ip(ip) and not ip.startswith('127.') and ip not in local_ips:
+                                        local_ips.append(ip)
+                                        self.logger.debug(f"Found IP from ip command: {ip}")
+                            else:
+                                # ifconfig output parsing (works for most Unix-like systems)
+                                ip_matches = re.findall(r'inet (?:addr:)?(\d+\.\d+\.\d+\.\d+)', output)
+                                for ip in ip_matches:
+                                    if self._is_valid_ip(ip) and not ip.startswith('127.') and ip not in local_ips:
+                                        local_ips.append(ip)
+                                        self.logger.debug(f"Found IP from ifconfig: {ip}")
+                            
+                            # If we found IPs, we can break out of trying more commands
+                            if local_ips:
+                                break
+                                
+                    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError) as cmd_e:
+                        self.logger.debug(f"Command {' '.join(cmd)} failed: {cmd_e}")
+                        continue
+                        
+            except Exception as e:
+                self.logger.debug(f"Command-based IP discovery failed: {e}")
+                
+            
+            # Try joining multicast group on each interface
+            joined_count = 0
+            joined_interfaces = []
+            
+            # Filter discovered IPs based on configuration
+            if self.config.listen_ips:
+                # Validate and filter configured listen IPs
+                valid_listen_ips = []
+                discovered_local_ips = local_ips.copy()  # Save original discovered IPs
+                
+                for ip in self.config.listen_ips:
+                    if self._is_valid_ip(ip):
+                        valid_listen_ips.append(ip)
+                    else:
+                        self.logger.warning(f"Invalid IP address in listen_ips configuration: {ip}")
+                
+                if valid_listen_ips:
+                    # Use configured IPs, whether they were auto-discovered or not
+                    local_ips = valid_listen_ips
+                    self.logger.info(f"Using configured listen IPs: {', '.join(local_ips)}")
+                    
+                    # Log which configured IPs were not auto-discovered (might be manually configured interfaces)
+                    not_discovered = [ip for ip in valid_listen_ips if ip not in discovered_local_ips]
+                    if not_discovered:
+                        self.logger.info(f"Using configured IPs not auto-discovered (may be manually configured): {', '.join(not_discovered)}")
+                else:
+                    self.logger.warning(f"No valid IPs in listen_ips configuration: {', '.join(self.config.listen_ips)}")
+                    # Fall back to discovered IPs
+            
+            # Log discovered/configured IPs for debugging
+            if local_ips:
+                self.logger.info(f"Using {len(local_ips)} network interfaces: {', '.join(local_ips)}")
+            else:
+                self.logger.warning("No network interfaces available, will try INADDR_ANY only")
+            
+            # OpenBSD and other BSD systems benefit from joining on multiple interfaces
+            if system in ['openbsd', 'freebsd', 'netbsd']:
+                # For BSD systems, join on ALL discovered multicast-capable interfaces
+                self.logger.info("BSD system detected - attempting to join multicast on all discovered interfaces")
+                for local_ip in local_ips:
+                    try:
+                        # Join on specific interface (important for BSD systems)
+                        mreq = struct.pack("!4s4s", socket.inet_aton(self.mdns_address), socket.inet_aton(local_ip))
+                        self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+                        self.logger.info(f"Joined multicast group {self.mdns_address} on interface {local_ip}")
+                        joined_count += 1
+                        joined_interfaces.append(local_ip)
+                            
+                    except OSError as e:
+                        self.logger.debug(f"Could not join multicast on IP {local_ip}: {e}")
+                        continue
+                
+                # If no specific interfaces worked, try INADDR_ANY as fallback
+                if joined_count == 0:
+                    try:
+                        mreq = struct.pack("!4sI", socket.inet_aton(self.mdns_address), socket.INADDR_ANY)
+                        self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+                        self.logger.info(f"Joined multicast group {self.mdns_address} on INADDR_ANY (fallback)")
+                        joined_count = 1
+                        joined_interfaces.append("INADDR_ANY")
+                    except OSError as e:
+                        self.logger.debug(f"Could not join multicast on INADDR_ANY: {e}")
+            else:
+                # For Linux and other systems, prefer specific interfaces if we found them
+                if local_ips:
+                    # Try joining on all discovered interfaces for better coverage
+                    for local_ip in local_ips:
+                        try:
+                            # Join on specific interface
+                            mreq = struct.pack("!4s4s", socket.inet_aton(self.mdns_address), socket.inet_aton(local_ip))
+                            self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+                            self.logger.info(f"Joined multicast group {self.mdns_address} on interface {local_ip}")
+                            joined_count += 1
+                            joined_interfaces.append(local_ip)
+                                
+                        except OSError as e:
+                            self.logger.debug(f"Could not join multicast on IP {local_ip}: {e}")
+                            continue
+                
+                # Always try INADDR_ANY as well for maximum compatibility
+                try:
+                    mreq = struct.pack("!4sI", socket.inet_aton(self.mdns_address), socket.INADDR_ANY)
+                    self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+                    self.logger.info(f"Joined multicast group {self.mdns_address} on INADDR_ANY")
+                    joined_count += 1
+                    joined_interfaces.append("INADDR_ANY")
+                except OSError as e:
+                    self.logger.debug(f"Could not join multicast on INADDR_ANY: {e}")
+            
+            if joined_count == 0:
+                raise OSError("Failed to join multicast group on any interface")
+            else:
+                self.logger.info(f"Successfully joined multicast group on {joined_count} interface(s): {', '.join(joined_interfaces)}")
                 
         except OSError as e:
             self.logger.error(f"Failed to join multicast group: {e}")
+            self.logger.error(f"This may indicate network interface configuration issues on {system}")
+            if system == 'openbsd':
+                self.logger.error("On OpenBSD, ensure the network interface supports multicast:")
+                self.logger.error("  - Check 'ifconfig' output for MULTICAST flag")
+                self.logger.error("  - Verify interface is UP and has an IP address")
+                self.logger.error("  - Consider enabling multicast routing if needed")
             return
         
         self.sock.setblocking(False)
@@ -184,12 +396,12 @@ class MDNSProxy:
             try:
                 await self._handle_packet()
                 packet_count += 1
-                if packet_count % 10 == 0:
+                if packet_count % 500 == 0:
                     self.logger.info(f"Processed {packet_count} packets so far")
             except Exception as e:
-                self.logger.error(f"Error in main loop: {e}")
-                self.logger.error(f"Error handling packet: {e}")
-                await asyncio.sleep(0.1)
+                #self.logger.error(f"Error in main loop: {e}")
+                #self.logger.error(f"Error handling packet: {e}")
+                await asyncio.sleep(0.5)
     
     async def _handle_packet(self):
         try:

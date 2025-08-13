@@ -37,7 +37,8 @@ ENV MDNS_PORT=5353 \
     WEB_PORT=9080 \
     WEB_HOST=0.0.0.0 \
     PERMISSIONS_FILE=/app/data/permissions.yaml \
-    LOG_LEVEL=INFO
+    LOG_LEVEL=INFO \
+    LISTEN_IPS=""
 
 # Switch to non-root user
 USER mdnsfw
